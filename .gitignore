@@ -4,9 +4,6 @@
 ### dotenv ###
 .env
 
-### User Uploaded Media Files ###
-media/
-
 ### Database Files ###
 *.sqlite3
 *.db
