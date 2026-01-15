@@ -1,126 +1,8 @@
-## database.py
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
-
-SQLALCHEMY_DATABASE_URL = "sqlite:///./blog.db"
-
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-def get_db():
-    with SessionLocal() as db:
-        yield db
-
-
-## models.py
-from __future__ import annotations
-
-from datetime import UTC, datetime
-
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from database import Base
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
-    email: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
-    image_file: Mapped[str | None] = mapped_column(
-        String(200),
-        nullable=True,
-        default=None,
-    )
-
-    posts: Mapped[list[Post]] = relationship(back_populates="author")
-
-    @property
-    def image_path(self) -> str:
-        if self.image_file:
-            return f"/media/profile_pics/{self.image_file}"
-        return "/static/profile_pics/default.jpg"
-
-
-class Post(Base):
-    __tablename__ = "posts"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    title: Mapped[str] = mapped_column(String(100), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
-        nullable=False,
-        index=True,
-    )
-    date_posted: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-    )
-
-    author: Mapped[User] = relationship(back_populates="posts")
-
-
-## get_user_posts
-@app.get("/api/users/{user_id}/posts", response_model=list[PostResponse])
-def get_user_posts(user_id: int, db: Annotated[Session, Depends(get_db)]):
-    result = db.execute(select(models.User).where(models.User.id == user_id))
-    user = result.scalars().first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    result = db.execute(select(models.Post).where(models.Post.user_id == user_id))
-    posts = result.scalars().all()
-    return posts
-
-
-## home
-@app.get("/", include_in_schema=False, name="home")
-@app.get("/posts", include_in_schema=False, name="posts")
-def home(request: Request, db: Annotated[Session, Depends(get_db)]):
-    result = db.execute(select(models.Post))
-    posts = result.scalars().all()
-    return templates.TemplateResponse(
-        request,
-        "home.html",
-        {"posts": posts, "title": "Home"},
-    )
-
-
-## post_page
-@app.get("/posts/{post_id}", include_in_schema=False)
-def post_page(request: Request, post_id: int, db: Annotated[Session, Depends(get_db)]):
-    result = db.execute(select(models.Post).where(models.Post.id == post_id))
-    post = result.scalars().first()
-    if post:
-        title = post.title[:50]
-        return templates.TemplateResponse(
-            request,
-            "post.html",
-            {"post": post, "title": title},
-        )
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
-
-
-## user_posts_page
-@app.get("/users/{user_id}/posts", include_in_schema=False, name="user_posts")
-def user_posts_page(
-    request: Request,
+## update_user
+@app.patch("/api/users/{user_id}", response_model=UserResponse)
+def update_user(
     user_id: int,
+    user_update: UserUpdate,
     db: Annotated[Session, Depends(get_db)],
 ):
     result = db.execute(select(models.User).where(models.User.id == user_id))
@@ -131,31 +13,44 @@ def user_posts_page(
             detail="User not found",
         )
 
-    result = db.execute(select(models.Post).where(models.Post.user_id == user_id))
-    posts = result.scalars().all()
-    return templates.TemplateResponse(
-        request,
-        "user_posts.html",
-        {"posts": posts, "user": user, "title": f"{user.username}'s Posts"},
-    )
+    if user_update.username is not None and user_update.username != user.username:
+        result = db.execute(
+            select(models.User).where(models.User.username == user_update.username),
+        )
+        existing_user = result.scalars().first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already exists",
+            )
+
+    if user_update.email is not None and user_update.email != user.email:
+        result = db.execute(
+            select(models.User).where(models.User.email == user_update.email),
+        )
+        existing_email = result.scalars().first()
+        if existing_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered",
+            )
+
+    if user_update.username is not None:
+        user.username = user_update.username
+    if user_update.email is not None:
+        user.email = user_update.email
+    if user_update.image_file is not None:
+        user.image_file = user_update.image_file
+
+    db.commit()
+    db.refresh(user)
+    return user
 
 
-## get_posts
-@app.get("/api/posts", response_model=list[PostResponse])
-def get_posts(db: Annotated[Session, Depends(get_db)]):
-    result = db.execute(select(models.Post))
-    posts = result.scalars().all()
-    return posts
-
-
-## create_post
-@app.post(
-    "/api/posts",
-    response_model=PostResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_post(post: PostCreate, db: Annotated[Session, Depends(get_db)]):
-    result = db.execute(select(models.User).where(models.User.id == post.user_id))
+## delete_user
+@app.delete("/api/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(user_id: int, db: Annotated[Session, Depends(get_db)]):
+    result = db.execute(select(models.User).where(models.User.id == user_id))
     user = result.scalars().first()
     if not user:
         raise HTTPException(
@@ -163,22 +58,5 @@ def create_post(post: PostCreate, db: Annotated[Session, Depends(get_db)]):
             detail="User not found",
         )
 
-    new_post = models.Post(
-        title=post.title,
-        content=post.content,
-        user_id=post.user_id,
-    )
-    db.add(new_post)
+    db.delete(user)
     db.commit()
-    db.refresh(new_post)
-    return new_post
-
-
-## get_post
-@app.get("/api/posts/{post_id}", response_model=PostResponse)
-def get_post(post_id: int, db: Annotated[Session, Depends(get_db)]):
-    result = db.execute(select(models.Post).where(models.Post.id == post_id))
-    post = result.scalars().first()
-    if post:
-        return post
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
