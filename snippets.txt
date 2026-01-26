@@ -1,79 +1,8 @@
-## create_access_token
-def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
-    """Create a JWT access token."""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(UTC) + expires_delta
-    else:
-        expire = datetime.now(UTC) + timedelta(
-            minutes=settings.access_token_expire_minutes,
-        )
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(
-        to_encode,
-        settings.secret_key.get_secret_value(),
-        algorithm=settings.algorithm,
-    )
-    return encoded_jwt
-
-
-
-## verify_access_token
-def verify_access_token(token: str) -> str | None:
-    """Verify a JWT access token and return the subject (user id) if valid."""
-    try:
-        payload = jwt.decode(
-            token,
-            settings.secret_key.get_secret_value(),
-            algorithms=[settings.algorithm],
-            options={"require": ["exp", "sub"]},
-        )
-    except jwt.InvalidTokenError:
-        return None
-    else:
-        return payload.get("sub")
-
-
-## login_for_access_token
-@router.post("/token", response_model=Token)
-async def login_for_access_token(
-    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-    db: Annotated[AsyncSession, Depends(get_db)],
-):
-    # Look up user by email (case-insensitive)
-    # Note: OAuth2PasswordRequestForm uses "username" field, but we treat it as email
-    result = await db.execute(
-        select(models.User).where(
-            func.lower(models.User.email) == form_data.username.lower(),
-        ),
-    )
-    user = result.scalars().first()
-
-    # Verify user exists and password is correct
-    # Don't reveal which one failed (security best practice)
-    if not user or not verify_password(form_data.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # Create access token with user id as subject
-    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
-    access_token = create_access_token(
-        data={"sub": str(user.id)},
-        expires_delta=access_token_expires,
-    )
-    return Token(access_token=access_token, token_type="bearer")
-
-
 ## get_current_user
-@router.get("/me", response_model=UserPrivate)
 async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
-):
-    """Get the currently authenticated user."""
+) -> models.User:
     user_id = verify_access_token(token)
     if user_id is None:
         raise HTTPException(
@@ -82,7 +11,6 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Validate user_id is a valid integer (defense against malformed JWT)
     try:
         user_id_int = int(user_id)
     except (TypeError, ValueError):
@@ -105,72 +33,171 @@ async def get_current_user(
     return user
 
 
-## login and register template_routes
-@app.get("/login", include_in_schema=False)
-async def login_page(request: Request):
-    return templates.TemplateResponse(
-        request,
-        "login.html",
-        {"title": "Login"},
-    )
 
-
-@app.get("/register", include_in_schema=False)
-async def register_page(request: Request):
-    return templates.TemplateResponse(
-        request,
-        "register.html",
-        {"title": "Register"},
-    )
-
-
-## navbar_right_side
-<!-- Shown when logged in (hidden by default, shown via JS) -->
+## loggedInNav
 <div id="loggedInNav" class="d-none">
-<button class="btn btn-outline-light mb-2 mb-md-0 me-md-2"
-        type="button"
-        data-bs-toggle="modal"
-        data-bs-target="#createPostModal">New Post</button>
-<span id="usernameDisplay" class="navbar-text me-md-2"></span>
-<button class="btn btn-outline-light mb-2 mb-md-0 me-md-3"
-        type="button"
-        id="logoutBtn">Logout</button>
-</div>
-<!-- Shown when logged out -->
-<div id="loggedOutNav">
-<a class="btn btn-outline-light mb-2 mb-md-0 me-md-2"
-    href="{{ url_for("login_page") }}">Login</a>
-<a class="btn btn-light mb-2 mb-md-0 me-md-3"
-    href="{{ url_for("register_page") }}">Register</a>
+    <button class="btn btn-outline-light mb-2 mb-md-0 me-md-2"
+            type="button"
+            data-bs-toggle="modal"
+            data-bs-target="#createPostModal">New Post</button>
+    <a class="btn btn-light mb-2 mb-md-0 me-md-3"
+       href="{{ url_for("account_page") }}"
+       id="accountBtn">Account</a>
 </div>
 
 
-## auth_state_script
-<!-- Auth State Management -->
+
+## layout_auth_ui_script
 <script type="module">
-  import { getCurrentUser, logout } from '/static/js/auth.js';
+    import { getCurrentUser } from '/static/js/auth.js';
 
-  // Update navbar based on auth state
-  async function updateAuthUI() {
-    const user = await getCurrentUser();
-    const loggedInNav = document.getElementById('loggedInNav');
-    const loggedOutNav = document.getElementById('loggedOutNav');
+    async function updateAuthUI() {
+        const user = await getCurrentUser();
+        const loggedInNav = document.getElementById('loggedInNav');
+        const loggedOutNav = document.getElementById('loggedOutNav');
+        const accountBtn = document.getElementById('accountBtn');
 
-    if (user) {
-      loggedInNav.classList.remove('d-none');
-      loggedInNav.classList.add('d-flex');
-      loggedOutNav.classList.add('d-none');
-      document.getElementById('usernameDisplay').textContent = user.email;
-    } else {
-      loggedInNav.classList.add('d-none');
-      loggedInNav.classList.remove('d-flex');
-      loggedOutNav.classList.remove('d-none');
+        if (user) {
+            loggedInNav.classList.remove('d-none');
+            loggedInNav.classList.add('d-flex');
+            loggedOutNav.classList.add('d-none');
+            accountBtn.textContent = user.username;
+        } else {
+            loggedInNav.classList.add('d-none');
+            loggedInNav.classList.remove('d-flex');
+            loggedOutNav.classList.remove('d-none');
+            accountBtn.textContent = 'Account';
+        }
     }
-  }
 
-  // Logout handler
-  document.getElementById('logoutBtn').addEventListener('click', logout);
-
-  // Update UI on page load
-  updateAuthUI();
+    updateAuthUI();
 </script>
+
+
+
+## token_check
+const token = getToken();
+if (!token) {
+    window.location.href = '/login';
+    return;
+}
+
+
+
+## if_401_check
+if (response.status === 401) {
+    window.location.href = '/login';
+    return;
+}
+
+
+
+## post_scripts_block
+{% block scripts %}
+<script type="module">
+    import { getCurrentUser, getToken } from '/static/js/auth.js';
+    import { getErrorMessage, showModal, hideModal } from '/static/js/utils.js';
+
+    const postId = {{ post.id }};
+    const postUserId = {{ post.user_id }};
+
+    // Show edit/delete buttons only if current user owns this post
+    async function checkOwnership() {
+        const user = await getCurrentUser();
+        if (user && user.id === postUserId) {
+            document.getElementById('postActions').classList.remove('d-none');
+        }
+    }
+
+    // Edit Post Form Handler
+    const editForm = document.getElementById('editPostForm');
+    editForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+
+        const token = getToken();
+        if (!token) { window.location.href = '/login'; return; }
+
+        const formData = new FormData(editForm);
+        const postData = Object.fromEntries(formData.entries());
+        delete postData.post_id;
+
+        try {
+            const response = await fetch(`/api/posts/${postId}`, {
+                method: 'PATCH',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`,
+                },
+                body: JSON.stringify(postData),
+            });
+
+            if (response.status === 401) { window.location.href = '/login'; return; }
+            if (response.status === 403) {
+                document.getElementById('errorMessage').textContent =
+                    'You are not authorized to edit this post.';
+                hideModal('editModal');
+                showModal('errorModal');
+                return;
+            }
+
+            if (response.ok) {
+                document.getElementById('successMessage').textContent =
+                    'Post updated successfully!';
+                hideModal('editModal');
+                showModal('successModal');
+
+                document.getElementById('successModal').addEventListener('hidden.bs.modal', () => {
+                    window.location.reload();
+                }, { once: true });
+            } else {
+                const error = await response.json();
+                document.getElementById('errorMessage').textContent = getErrorMessage(error);
+                hideModal('editModal');
+                showModal('errorModal');
+            }
+        } catch (error) {
+            document.getElementById('errorMessage').textContent =
+                'Network error. Please check your connection and try again.';
+            showModal('errorModal');
+        }
+    });
+
+    // Delete Post Handler
+    const deleteButton = document.getElementById('confirmDelete');
+    deleteButton.addEventListener('click', async () => {
+        const token = getToken();
+        if (!token) { window.location.href = '/login'; return; }
+
+        try {
+            const response = await fetch(`/api/posts/${postId}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${token}` },
+            });
+
+            if (response.status === 401) { window.location.href = '/login'; return; }
+            if (response.status === 403) {
+                document.getElementById('errorMessage').textContent =
+                    'You are not authorized to delete this post.';
+                hideModal('deleteModal');
+                showModal('errorModal');
+                return;
+            }
+
+            if (response.status === 204) {
+                window.location.href = '/';
+            } else {
+                const error = await response.json();
+                document.getElementById('errorMessage').textContent = getErrorMessage(error);
+                hideModal('deleteModal');
+                showModal('errorModal');
+            }
+        } catch (error) {
+            document.getElementById('errorMessage').textContent =
+                'Network error. Please check your connection and try again.';
+            showModal('errorModal');
+        }
+    });
+
+    checkOwnership();
+</script>
+{% endblock scripts %}
