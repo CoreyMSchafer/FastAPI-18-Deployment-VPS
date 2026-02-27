@@ -1,203 +1,226 @@
-## get_current_user
-async def get_current_user(
-    token: Annotated[str, Depends(oauth2_scheme)],
+## Process Image Function
+def process_profile_image(content: bytes) -> str:
+    with Image.open(BytesIO(content)) as original:
+        img = ImageOps.exif_transpose(original)
+
+        img = ImageOps.fit(img, (300, 300), method=Image.Resampling.LANCZOS)
+
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+
+        filename = f"{uuid.uuid4().hex}.jpg"
+        filepath = PROFILE_PICS_DIR / filename
+
+        PROFILE_PICS_DIR.mkdir(parents=True, exist_ok=True)
+
+        img.save(filepath, "JPEG", quality=85, optimize=True)
+
+    return filename
+
+
+
+## Delete Profile Image Function
+def delete_profile_image(filename: str | None) -> None:
+    if filename is None:
+        return
+
+    filepath = PROFILE_PICS_DIR / filename
+    if filepath.exists():
+        filepath.unlink()
+
+
+
+## Upload Profile Picture Endpoint
+@router.patch("/{user_id}/picture", response_model=UserPrivate)
+async def upload_profile_picture(
+    user_id: int,
+    file: UploadFile,
+    current_user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> models.User:
-    user_id = verify_access_token(token)
-    if user_id is None:
+):
+    if current_user.id != user_id:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to update this user's picture",
+        )
+
+    content = await file.read()
+
+    if len(content) > settings.max_upload_size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File too large. Maximum size is {settings.max_upload_size_bytes // (1024 * 1024)}MB",
         )
 
     try:
-        user_id_int = int(user_id)
-    except (TypeError, ValueError):
+        new_filename = await run_in_threadpool(process_profile_image, content)
+    except UnidentifiedImageError as err:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image file. Please upload a valid image (JPEG, PNG, GIF, WebP).",
+        ) from err
+
+    old_filename = current_user.image_file
+
+    current_user.image_file = new_filename
+    await db.commit()
+    await db.refresh(current_user)
+
+    if old_filename:
+        delete_profile_image(old_filename)
+
+    return current_user
+
+
+
+## Delete Profile Picture Endpoint
+@router.delete("/{user_id}/picture", response_model=UserPrivate)
+async def delete_user_picture(
+    user_id: int,
+    current_user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to delete this user's picture",
         )
 
-    result = await db.execute(
-        select(models.User).where(models.User.id == user_id_int),
-    )
-    user = result.scalars().first()
-    if not user:
+    old_filename = current_user.image_file
+
+    if old_filename is None:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No profile picture to delete",
         )
-    return user
+
+    current_user.image_file = None
+    await db.commit()
+    await db.refresh(current_user)
+
+    delete_profile_image(old_filename)
+
+    return current_user
 
 
 
-## loggedInNav
-<div id="loggedInNav" class="d-none">
-    <button class="btn btn-outline-light mb-2 mb-md-0 me-md-2"
-            type="button"
-            data-bs-toggle="modal"
-            data-bs-target="#createPostModal">New Post</button>
-    <a class="btn btn-light mb-2 mb-md-0 me-md-3"
-       href="{{ url_for("account_page") }}"
-       id="accountBtn">Account</a>
-</div>
+## Profile Picture HTML
+    <!-- Profile Picture Section -->
+    <div class="mb-4">
+      <h5>Profile Picture</h5>
+      <!-- Preview container -->
+      <div class="mb-3">
+        <img id="imagePreview"
+             class="rounded-circle d-none object-fit-cover"
+             alt="Image preview"
+             width="150"
+             height="150">
+      </div>
+      <!-- File input and upload button -->
+      <div class="d-flex gap-2 align-items-start">
+        <input type="file"
+               class="form-control file-input-sm"
+               id="pictureInput"
+               accept="image/*">
+        <button type="button" class="btn btn-primary" id="uploadPictureBtn" disabled>Upload</button>
+      </div>
+      <small class="text-body-secondary">Maximum file size: 5MB. Supported formats: JPEG, PNG, GIF, WebP.</small>
+    </div>
 
 
 
-## layout_auth_ui_script
-<script type="module">
-    import { getCurrentUser } from '/static/js/auth.js';
+## Image Preview Handler
+  // Image Preview Handler
+  const pictureInput = document.getElementById('pictureInput');
+  const imagePreview = document.getElementById('imagePreview');
+  const uploadBtn = document.getElementById('uploadPictureBtn');
 
-    async function updateAuthUI() {
-        const user = await getCurrentUser();
-        const loggedInNav = document.getElementById('loggedInNav');
-        const loggedOutNav = document.getElementById('loggedOutNav');
-        const accountBtn = document.getElementById('accountBtn');
+  pictureInput.addEventListener('change', (event) => {
+    const file = event.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        imagePreview.src = e.target.result;
+        imagePreview.classList.remove('d-none');
+      };
+      reader.readAsDataURL(file);
 
-        if (user) {
-            loggedInNav.classList.remove('d-none');
-            loggedInNav.classList.add('d-flex');
-            loggedOutNav.classList.add('d-none');
-            accountBtn.textContent = user.username;
-        } else {
-            loggedInNav.classList.add('d-none');
-            loggedInNav.classList.remove('d-flex');
-            loggedOutNav.classList.remove('d-none');
-            accountBtn.textContent = 'Account';
-        }
+      uploadBtn.disabled = false;
+    } else {
+      imagePreview.classList.add('d-none');
+      uploadBtn.disabled = true;
+    }
+  });
+
+
+
+## Upload Profile Picture Handler
+  // Upload Profile Picture Handler
+  uploadBtn.addEventListener('click', async () => {
+    const token = getToken();
+    if (!token) {
+      window.location.href = '/login';
+      return;
     }
 
-    updateAuthUI();
-</script>
-
-
-
-## token_check
-const token = getToken();
-if (!token) {
-    window.location.href = '/login';
-    return;
-}
-
-
-
-## if_401_check
-if (response.status === 401) {
-    window.location.href = '/login';
-    return;
-}
-
-
-
-## post_scripts_block
-{% block scripts %}
-<script type="module">
-    import { getCurrentUser, getToken } from '/static/js/auth.js';
-    import { getErrorMessage, showModal, hideModal } from '/static/js/utils.js';
-
-    const postId = {{ post.id }};
-    const postUserId = {{ post.user_id }};
-
-    // Show edit/delete buttons only if current user owns this post
-    async function checkOwnership() {
-        const user = await getCurrentUser();
-        if (user && user.id === postUserId) {
-            document.getElementById('postActions').classList.remove('d-none');
-        }
+    const file = pictureInput.files[0];
+    if (!file) {
+      return;
     }
 
-    // Edit Post Form Handler
-    const editForm = document.getElementById('editPostForm');
-    editForm.addEventListener('submit', async (event) => {
-        event.preventDefault();
+    // Use FormData for file uploads (not JSON)
+    const formData = new FormData();
+    formData.append('file', file);
 
-        const token = getToken();
-        if (!token) { window.location.href = '/login'; return; }
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = 'Uploading...';
 
-        const formData = new FormData(editForm);
-        const postData = Object.fromEntries(formData.entries());
-        delete postData.post_id;
+    try {
+      const response = await fetch(`/api/users/${currentUserId}/picture`, {
+        method: 'PATCH',
+        headers: {
+          // Don't set Content-Type — browser sets multipart boundary automatically
+          'Authorization': `Bearer ${token}`,
+        },
+        body: formData,
+      });
 
-        try {
-            const response = await fetch(`/api/posts/${postId}`, {
-                method: 'PATCH',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${token}`,
-                },
-                body: JSON.stringify(postData),
-            });
+      if (response.status === 401) {
+        window.location.href = '/login';
+        return;
+      }
 
-            if (response.status === 401) { window.location.href = '/login'; return; }
-            if (response.status === 403) {
-                document.getElementById('errorMessage').textContent =
-                    'You are not authorized to edit this post.';
-                hideModal('editModal');
-                showModal('errorModal');
-                return;
-            }
+      if (response.status === 403) {
+        document.getElementById('errorMessage').textContent =
+          'You are not authorized to update this profile picture.';
+        showModal('errorModal');
+        return;
+      }
 
-            if (response.ok) {
-                document.getElementById('successMessage').textContent =
-                    'Post updated successfully!';
-                hideModal('editModal');
-                showModal('successModal');
+      if (response.ok) {
+        const data = await response.json();
 
-                document.getElementById('successModal').addEventListener('hidden.bs.modal', () => {
-                    window.location.reload();
-                }, { once: true });
-            } else {
-                const error = await response.json();
-                document.getElementById('errorMessage').textContent = getErrorMessage(error);
-                hideModal('editModal');
-                showModal('errorModal');
-            }
-        } catch (error) {
-            document.getElementById('errorMessage').textContent =
-                'Network error. Please check your connection and try again.';
-            showModal('errorModal');
-        }
-    });
+        clearUserCache();
 
-    // Delete Post Handler
-    const deleteButton = document.getElementById('confirmDelete');
-    deleteButton.addEventListener('click', async () => {
-        const token = getToken();
-        if (!token) { window.location.href = '/login'; return; }
+        document.getElementById('profileImage').src = data.image_path;
 
-        try {
-            const response = await fetch(`/api/posts/${postId}`, {
-                method: 'DELETE',
-                headers: { 'Authorization': `Bearer ${token}` },
-            });
+        pictureInput.value = '';
+        imagePreview.classList.add('d-none');
 
-            if (response.status === 401) { window.location.href = '/login'; return; }
-            if (response.status === 403) {
-                document.getElementById('errorMessage').textContent =
-                    'You are not authorized to delete this post.';
-                hideModal('deleteModal');
-                showModal('errorModal');
-                return;
-            }
-
-            if (response.status === 204) {
-                window.location.href = '/';
-            } else {
-                const error = await response.json();
-                document.getElementById('errorMessage').textContent = getErrorMessage(error);
-                hideModal('deleteModal');
-                showModal('errorModal');
-            }
-        } catch (error) {
-            document.getElementById('errorMessage').textContent =
-                'Network error. Please check your connection and try again.';
-            showModal('errorModal');
-        }
-    });
-
-    checkOwnership();
-</script>
-{% endblock scripts %}
+        document.getElementById('successMessage').textContent =
+          'Profile picture updated successfully!';
+        showModal('successModal');
+      } else {
+        const error = await response.json();
+        document.getElementById('errorMessage').textContent = getErrorMessage(error);
+        showModal('errorModal');
+      }
+    } catch (error) {
+      document.getElementById('errorMessage').textContent =
+        'Network error. Please check your connection and try again.';
+      showModal('errorModal');
+    } finally {
+      uploadBtn.disabled = pictureInput.files.length === 0;
+      uploadBtn.textContent = 'Upload';
+    }
+  });
