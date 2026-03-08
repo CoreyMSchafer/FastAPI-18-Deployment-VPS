@@ -142,8 +142,7 @@ async def general_http_exception_handler(
 
     message = (
         exception.detail
-        if exception.detail
-        else "An error occurred. Please check your request and try again."
+        or "An error occurred. Please check your request and try again."
     )
 
     return templates.TemplateResponse(
