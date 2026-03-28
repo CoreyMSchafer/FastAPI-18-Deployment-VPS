@@ -1,381 +1,698 @@
-## Paginated Post Response Schema
-class PaginatedPostsResponse(BaseModel):
-    posts: list[PostResponse]
-    total: int
-    skip: int
-    limit: int
-    has_more: bool
+## Email Configuration Settings
+mail_server: str = "localhost"
+mail_port: int = 587
+mail_username: str = ""
+mail_password: SecretStr = SecretStr("")
+mail_from: str = "noreply@example.com"
+mail_use_tls: bool = True
+
+frontend_url: str = "http://localhost:8000"
 
 
+## .env Email Configuration
+MAIL_SERVER=sandbox.smtp.mailtrap.io
+MAIL_PORT=2525
+MAIL_USERNAME=
+MAIL_PASSWORD=
+MAIL_FROM=noreply@fastapiblog.com
+MAIL_USE_TLS=true
+FRONTEND_URL=http://localhost:8000
 
-## get_posts - skip and limit parameters
-    skip: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=100)] = 10,
+
+## email_utils.py imports
+from email.message import EmailMessage
+
+import aiosmtplib
+from fastapi.templating import Jinja2Templates
+
+from config import settings
 
 
-## get_posts - count query
-    count_result = await db.execute(select(func.count()).select_from(models.Post))
-    total = count_result.scalar() or 0
+## send_email function
+async def send_email(
+    to_email: str,
+    subject: str,
+    plain_text: str,
+    html_content: str | None = None,
+) -> None:
+    message = EmailMessage()
+    message["From"] = settings.mail_from
+    message["To"] = to_email
+    message["Subject"] = subject
+
+    message.set_content(plain_text)
+
+    if html_content:
+        message.add_alternative(html_content, subtype="html")
 
 
-## get_posts - return PaginatedPostsResponse
-    return PaginatedPostsResponse(
-        posts=[PostResponse.model_validate(post) for post in posts],
-        total=total,
-        skip=skip,
-        limit=limit,
-        has_more=has_more,
+## aiosmtplib.send call
+        await aiosmtplib.send(
+            message,
+            hostname=settings.mail_server,
+            port=settings.mail_port,
+            username=settings.mail_username if settings.mail_username else None,
+            password=settings.mail_password.get_secret_value() or None,
+            start_tls=settings.mail_use_tls,
+        )
+
+
+## send_password_reset_email function
+async def send_password_reset_email(to_email: str, username: str, token: str) -> None:
+    reset_url = f"{settings.frontend_url}/reset-password?token={token}"
+
+    template = templates.env.get_template("email/password_reset.html")
+    html_content = template.render(reset_url=reset_url, username=username)
+
+    plain_text = f"""Hi {username},
+
+You requested to reset your password. Click the link below to set a new password:
+
+{reset_url}
+
+This link will expire in 1 hour.
+
+If you didn't request this, you can safely ignore this email.
+
+Best regards,
+The FastAPI Blog Team
+"""
+
+    await send_email(
+        to_email=to_email,
+        subject="Reset Your Password - FastAPI Blog",
+        plain_text=plain_text,
+        html_content=html_content,
     )
 
 
-## home route - paginated
-@app.get("/", include_in_schema=False, name="home")
-@app.get("/posts", include_in_schema=False, name="posts")
-async def home(request: Request, db: Annotated[AsyncSession, Depends(get_db)]):
-    count_result = await db.execute(select(func.count()).select_from(models.Post))
-    total = count_result.scalar() or 0
+## templates/email/password_reset.html
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reset Your Password</title>
+  </head>
+  <body style="margin: 0;
+               padding: 0;
+               font-family: Arial, Helvetica, sans-serif;
+               background-color: #f4f4f4">
+    <table role="presentation"
+           width="100%"
+           cellspacing="0"
+           cellpadding="0"
+           style="background-color: #f4f4f4;
+                  padding: 20px 0">
+      <tr>
+        <td align="center">
+          <table role="presentation"
+                 width="600"
+                 cellspacing="0"
+                 cellpadding="0"
+                 style="background-color: #ffffff;
+                        border-radius: 8px;
+                        overflow: hidden">
+            <!-- Header -->
+            <tr>
+              <td style="background-color: #527c9f; padding: 30px; text-align: center;">
+                <h1 style="margin: 0; color: #ffffff; font-size: 24px;">FastAPI Blog</h1>
+              </td>
+            </tr>
+            <!-- Body -->
+            <tr>
+              <td style="padding: 40px 30px;">
+                <h2 style="margin: 0 0 20px 0; color: #333333; font-size: 20px;">Reset Your Password</h2>
+                <p style="margin: 0 0 15px 0;
+                          color: #555555;
+                          font-size: 16px;
+                          line-height: 1.5">Hi {{ username }},</p>
+                <p style="margin: 0 0 25px 0;
+                          color: #555555;
+                          font-size: 16px;
+                          line-height: 1.5">
+                  You requested to reset your password. Click the button below to set a new password:
+                </p>
+                <!-- Button -->
+                <table role="presentation"
+                       cellspacing="0"
+                       cellpadding="0"
+                       style="margin: 0 auto 25px auto">
+                  <tr>
+                    <td style="background-color: #527c9f; border-radius: 5px;">
+                      <a href="{{ reset_url }}"
+                         style="display: inline-block;
+                                padding: 15px 30px;
+                                color: #ffffff;
+                                text-decoration: none;
+                                font-size: 16px;
+                                font-weight: bold">Reset Password</a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin: 0 0 15px 0;
+                          color: #777777;
+                          font-size: 14px;
+                          line-height: 1.5">
+                  This link will expire in <strong>1 hour</strong>.
+                </p>
+                <p style="margin: 0 0 15px 0;
+                          color: #777777;
+                          font-size: 14px;
+                          line-height: 1.5">
+                  If you didn't request this password reset, you can safely ignore this email. Your password will remain unchanged.
+                </p>
+                <!-- Fallback Link -->
+                <p style="margin: 25px 0 0 0;
+                          color: #999999;
+                          font-size: 12px;
+                          line-height: 1.5">
+                  If the button doesn't work, copy and paste this link into your browser:
+                  <br>
+                  <a href="{{ reset_url }}" style="color: #527c9f; word-break: break-all;">{{ reset_url }}</a>
+                </p>
+              </td>
+            </tr>
+            <!-- Footer -->
+            <tr>
+              <td style="background-color: #f8f9fa;
+                         padding: 20px 30px;
+                         text-align: center;
+                         border-top: 1px solid #eeeeee">
+                <p style="margin: 0; color: #999999; font-size: 12px;">
+                  This is an automated message from FastAPI Blog.
+                  <br>
+                  Please do not reply to this email.
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
 
+
+## PasswordResetToken model
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+    )
+
+    user: Mapped[User] = relationship(back_populates="reset_tokens")
+
+
+## User.reset_tokens relationship
+    reset_tokens: Mapped[list[PasswordResetToken]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+## Password Reset Schemas
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr = Field(max_length=120)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+## forgot_password endpoint
+@router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
+async def forgot_password(
+    request_data: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
     result = await db.execute(
-        select(models.Post)
-        .options(selectinload(models.Post.author))
-        .order_by(models.Post.date_posted.desc())
-        .limit(settings.posts_per_page),
+        select(models.User).where(
+            func.lower(models.User.email) == request_data.email.lower(),
+        ),
     )
-    posts = result.scalars().all()
+    user = result.scalars().first()
 
-    has_more = len(posts) < total
+    if user:
+        await db.execute(
+            sql_delete(models.PasswordResetToken).where(
+                models.PasswordResetToken.user_id == user.id,
+            ),
+        )
 
-    return templates.TemplateResponse(
-        request,
-        "home.html",
-        {
-            "posts": posts,
-            "title": "Home",
-            "limit": settings.posts_per_page,
-            "has_more": has_more,
-        },
-    )
+        token = generate_reset_token()
+        token_hash = hash_reset_token(token)
+        expires_at = datetime.now(UTC) + timedelta(
+            minutes=settings.reset_token_expire_minutes
+        )
 
+        reset_token = models.PasswordResetToken(
+            user_id=user.id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+        )
+        db.add(reset_token)
+        await db.commit()
 
-## utils.js - escapeHtml and formatDate
-// XSS prevention for dynamic content insertion
-export function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
-}
+        background_tasks.add_task(
+            send_password_reset_email,
+            to_email=user.email,
+            username=user.username,
+            token=token,
+        )
 
-// Date formatting to match server's strftime("%B %d, %Y")
-export function formatDate(dateString) {
-  const date = new Date(dateString);
-  return date.toLocaleDateString("en-US", {
-    year: "numeric",
-    month: "long",
-    day: "2-digit",
-  });
-}
-
-
-## home template - Load More button
-  {% if has_more %}
-    <div class="text-center mb-4">
-      <button type="button" class="btn btn-outline-primary" id="loadMoreBtn">Load More Posts</button>
-    </div>
-  {% endif %}
-
-
-## home page - scripts block
-{% block scripts %}
-  <script type="module">
-  import { escapeHtml, formatDate } from '/static/js/utils.js';
-
-  // Pagination state - initialized from server-rendered values
-  let currentOffset = {{ limit }};  // Start after server-rendered posts
-  const limit = {{ limit }};
-  let hasMore = {{ 'true' if has_more else 'false' }};
-
-  const postsContainer = document.getElementById('postsContainer');
-  const loadMoreBtn = document.getElementById('loadMoreBtn');
-
-  // Create HTML for a single post (matching server-rendered structure)
-  function createPostHTML(post) {
-    return `
-      <article class="content-section py-3 px-4 mb-4">
-        <div class="d-flex align-items-start gap-4">
-          <img class="rounded-circle article-img flex-shrink-0" src="${escapeHtml(post.author.image_path)}" alt="${escapeHtml(post.author.username)}'s profile picture" width="64" height="64" loading="lazy">
-          <div class="flex-grow-1">
-            <div class="article-metadata mb-2">
-              <a class="me-2" href="/users/${post.author.id}/posts">${escapeHtml(post.author.username)}</a>
-              <small class="text-body-secondary">${formatDate(post.date_posted)}</small>
-            </div>
-            <h2>
-              <a class="article-title" href="/posts/${post.id}">${escapeHtml(post.title)}</a>
-            </h2>
-            <p class="article-content">${escapeHtml(post.content)}</p>
-          </div>
-        </div>
-      </article>
-    `;
-  }
-
-  // Load more posts from the API
-  async function loadMorePosts() {
-    // Disable button and show loading state
-    loadMoreBtn.disabled = true;
-    loadMoreBtn.textContent = 'Loading...';
-
-    let errorOccurred = false;
-
-    try {
-      const response = await fetch(`/api/posts?skip=${currentOffset}&limit=${limit}`);
-
-      if (!response.ok) {
-        throw new Error('Failed to fetch posts');
-      }
-
-      const data = await response.json();
-
-      // Append new posts to the container
-      for (const post of data.posts) {
-        postsContainer.insertAdjacentHTML('beforeend', createPostHTML(post));
-      }
-
-      // Update pagination state
-      currentOffset += data.posts.length;
-      hasMore = data.has_more;
-
-      // Hide button if no more posts
-      if (!hasMore) {
-        loadMoreBtn.classList.add('d-none');
-      }
-    } catch (error) {
-      errorOccurred = true;
-      console.error('Error loading posts:', error);
-      // Show error message and keep button enabled for retry
-      loadMoreBtn.textContent = 'Error - Click to Retry';
-      loadMoreBtn.disabled = false;
-    } finally {
-      // Re-enable button and reset text only if no error occurred
-      if (!errorOccurred && hasMore) {
-        loadMoreBtn.disabled = false;
-        loadMoreBtn.textContent = 'Load More Posts';
-      }
+    return {
+        "message": "If an account exists with this email, you will receive password reset instructions."
     }
-  }
-
-  // Add click handler if button exists
-  if (loadMoreBtn) {
-    loadMoreBtn.addEventListener('click', loadMorePosts);
-  }
-  </script>
-{% endblock scripts %}
 
 
-## get_user_posts - paginated
-@router.get("/{user_id}/posts", response_model=PaginatedPostsResponse)
-async def get_user_posts(
-    user_id: int,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    skip: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=100)] = 10,
-):
-    result = await db.execute(select(models.User).where(models.User.id == user_id))
-    user = result.scalars().first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    count_result = await db.execute(
-        select(func.count())
-        .select_from(models.Post)
-        .where(models.Post.user_id == user_id),
-    )
-    total = count_result.scalar() or 0
-
-    result = await db.execute(
-        select(models.Post)
-        .options(selectinload(models.Post.author))
-        .where(models.Post.user_id == user_id)
-        .order_by(models.Post.date_posted.desc())
-        .offset(skip)
-        .limit(limit),
-    )
-    posts = result.scalars().all()
-
-    has_more = skip + len(posts) < total
-
-    return PaginatedPostsResponse(
-        posts=[PostResponse.model_validate(post) for post in posts],
-        total=total,
-        skip=skip,
-        limit=limit,
-        has_more=has_more,
-    )
-
-
-## user_posts_page route - paginated
-@app.get("/users/{user_id}/posts", include_in_schema=False, name="user_posts")
-async def user_posts_page(
-    request: Request,
-    user_id: int,
+## reset_password endpoint
+@router.post("/reset-password", status_code=status.HTTP_200_OK)
+async def reset_password(
+    request_data: ResetPasswordRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    result = await db.execute(select(models.User).where(models.User.id == user_id))
-    user = result.scalars().first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    count_result = await db.execute(
-        select(func.count())
-        .select_from(models.Post)
-        .where(models.Post.user_id == user_id),
-    )
-    total = count_result.scalar() or 0
+    token_hash = hash_reset_token(request_data.token)
 
     result = await db.execute(
-        select(models.Post)
-        .options(selectinload(models.Post.author))
-        .where(models.Post.user_id == user_id)
-        .order_by(models.Post.date_posted.desc())
-        .limit(settings.posts_per_page),
+        select(models.PasswordResetToken).where(
+            models.PasswordResetToken.token_hash == token_hash,
+        ),
     )
-    posts = result.scalars().all()
+    reset_token = result.scalars().first()
 
-    has_more = len(posts) < total
+    if not reset_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset token",
+        )
 
+    if reset_token.expires_at.replace(tzinfo=UTC) < datetime.now(UTC):
+        await db.delete(reset_token)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset token",
+        )
+
+    result = await db.execute(
+        select(models.User).where(models.User.id == reset_token.user_id),
+    )
+    user = result.scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset token",
+        )
+
+    user.password_hash = hash_password(request_data.new_password)
+
+    await db.execute(
+        sql_delete(models.PasswordResetToken).where(
+            models.PasswordResetToken.user_id == user.id,
+        ),
+    )
+
+    await db.commit()
+    return {
+        "message": "Password reset successfully. You can now log in with your new password."
+    }
+
+
+## change_password endpoint
+@router.patch("/me/password", status_code=status.HTTP_200_OK)
+async def change_password(
+    password_data: ChangePasswordRequest,
+    current_user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    if not verify_password(password_data.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    current_user.password_hash = hash_password(password_data.new_password)
+
+    await db.execute(
+        sql_delete(models.PasswordResetToken).where(
+            models.PasswordResetToken.user_id == current_user.id,
+        ),
+    )
+
+    await db.commit()
+    return {"message": "Password changed successfully"}
+
+
+## main.py template routes
+@app.get("/forgot-password", include_in_schema=False)
+async def forgot_password_page(request: Request):
     return templates.TemplateResponse(
         request,
-        "user_posts.html",
-        {
-            "posts": posts,
-            "user": user,
-            "title": f"{user.username}'s Posts",
-            "limit": settings.posts_per_page,
-            "has_more": has_more,
-        },
+        "forgot_password.html",
+        {"title": "Forgot Password"},
     )
 
 
-## user_posts.html - full template
+@app.get("/reset-password", include_in_schema=False)
+async def reset_password_page(request: Request):
+    response = templates.TemplateResponse(
+        request,
+        "reset_password.html",
+        {"title": "Reset Password"},
+    )
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+## templates/forgot_password.html
 {% extends "layout.html" %}
 {% block content %}
-  <h1 class="mb-4">Posts by {{ user.username }}</h1>
-  <div id="postsContainer">
-    {% for post in posts %}
-      <article class="content-section py-3 px-4 mb-4">
-        <div class="d-flex align-items-start gap-4">
-          <img class="rounded-circle article-img flex-shrink-0"
-               src="{{ post.author.image_path }}"
-               alt="{{ post.author.username }}'s profile picture"
-               width="64"
-               height="64"
-               loading="lazy">
-          <div class="flex-grow-1">
-            <div class="article-metadata mb-2">
-              <a class="me-2"
-                 href="{{ url_for('user_posts', user_id=post.author.id) }}">{{ post.author.username }}</a>
-              <small class="text-body-secondary">{{ post.date_posted.strftime("%B %d, %Y") }}</small>
-            </div>
-            <h2>
-              <a class="article-title"
-                 href="{{ url_for('post_page', post_id=post.id) }}">{{ post.title }}</a>
-            </h2>
-            <p class="article-content">{{ post.content }}</p>
-          </div>
-        </div>
-      </article>
-    {% else %}
-      <p class="text-body-secondary">No posts by this user yet.</p>
-    {% endfor %}
+  <div class="content-section py-3 px-4 mb-4">
+    <h2 class="mb-4">Forgot Password</h2>
+    <p class="text-body-secondary mb-4">Enter your email address and we'll send you a link to reset your password.</p>
+    <form id="forgotPasswordForm">
+      <div class="mb-3">
+        <label for="email" class="form-label">Email</label>
+        <input type="email"
+               class="form-control"
+               id="email"
+               name="email"
+               required
+               autofocus>
+      </div>
+      <button type="submit" class="btn btn-primary" id="submitBtn">Send Reset Link</button>
+    </form>
+    <p class="mt-3">
+      Remember your password? <a href="{{ url_for("login_page") }}">Login here</a>
+    </p>
   </div>
-
-  {% if has_more %}
-    <div class="text-center mb-4">
-      <button type="button" class="btn btn-outline-primary" id="loadMoreBtn">Load More Posts</button>
-    </div>
-  {% endif %}
 {% endblock content %}
 
 {% block scripts %}
   <script type="module">
-  import { escapeHtml, formatDate } from '/static/js/utils.js';
+  import { getErrorMessage, showModal } from '/static/js/utils.js';
 
-  const userId = {{ user.id }};
-  let currentOffset = {{ limit }};
-  const limit = {{ limit }};
-  let hasMore = {{ 'true' if has_more else 'false' }};
+  const forgotPasswordForm = document.getElementById('forgotPasswordForm');
+  const submitBtn = document.getElementById('submitBtn');
 
-  const postsContainer = document.getElementById('postsContainer');
-  const loadMoreBtn = document.getElementById('loadMoreBtn');
+  forgotPasswordForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
 
-  function createPostHTML(post) {
-    return `
-      <article class="content-section py-3 px-4 mb-4">
-        <div class="d-flex align-items-start gap-4">
-          <img class="rounded-circle article-img flex-shrink-0" src="${escapeHtml(post.author.image_path)}" alt="${escapeHtml(post.author.username)}'s profile picture" width="64" height="64" loading="lazy">
-          <div class="flex-grow-1">
-            <div class="article-metadata mb-2">
-              <a class="me-2" href="/users/${post.author.id}/posts">${escapeHtml(post.author.username)}</a>
-              <small class="text-body-secondary">${formatDate(post.date_posted)}</small>
-            </div>
-            <h2>
-              <a class="article-title" href="/posts/${post.id}">${escapeHtml(post.title)}</a>
-            </h2>
-            <p class="article-content">${escapeHtml(post.content)}</p>
-          </div>
-        </div>
-      </article>
-    `;
-  }
+    // Disable button during submission
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Sending...';
 
-  async function loadMorePosts() {
-    loadMoreBtn.disabled = true;
-    loadMoreBtn.textContent = 'Loading...';
-
-    let errorOccurred = false;
+    const formData = new FormData(forgotPasswordForm);
+    const data = Object.fromEntries(formData.entries());
 
     try {
-      const response = await fetch(`/api/users/${userId}/posts?skip=${currentOffset}&limit=${limit}`);
+      const response = await fetch('/api/users/forgot-password', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data),
+      });
 
-      if (!response.ok) {
-        throw new Error('Failed to fetch posts');
-      }
+      // Always show success message (even if email doesn't exist - security)
+      if (response.status === 202) {
+        document.getElementById('successMessage').textContent =
+          'If an account exists with this email, you will receive password reset instructions shortly.';
+        showModal('successModal');
 
-      const data = await response.json();
-
-      for (const post of data.posts) {
-        postsContainer.insertAdjacentHTML('beforeend', createPostHTML(post));
-      }
-
-      currentOffset += data.posts.length;
-      hasMore = data.has_more;
-
-      if (!hasMore) {
-        loadMoreBtn.classList.add('d-none');
+        // Clear form
+        forgotPasswordForm.reset();
+      } else {
+        const error = await response.json();
+        document.getElementById('errorMessage').textContent = getErrorMessage(error);
+        showModal('errorModal');
       }
     } catch (error) {
-      errorOccurred = true;
-      console.error('Error loading posts:', error);
-      loadMoreBtn.textContent = 'Error - Click to Retry';
-      loadMoreBtn.disabled = false;
+      document.getElementById('errorMessage').textContent =
+        'Network error. Please check your connection and try again.';
+      showModal('errorModal');
     } finally {
-      if (!errorOccurred && hasMore) {
-        loadMoreBtn.disabled = false;
-        loadMoreBtn.textContent = 'Load More Posts';
-      }
+      // Re-enable button
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Send Reset Link';
     }
-  }
-
-  if (loadMoreBtn) {
-    loadMoreBtn.addEventListener('click', loadMorePosts);
-  }
+  });
   </script>
 {% endblock scripts %}
+
+
+## templates/reset_password.html
+{% extends "layout.html" %}
+{% block content %}
+  <div class="content-section py-3 px-4 mb-4">
+    <h2 class="mb-4">Reset Password</h2>
+    <p class="text-body-secondary mb-4">Enter your new password below.</p>
+    <form id="resetPasswordForm">
+      <div class="mb-3">
+        <label for="newPassword" class="form-label">New Password</label>
+        <input type="password"
+               class="form-control"
+               id="newPassword"
+               name="new_password"
+               required
+               minlength="8"
+               autofocus>
+        <div class="form-text">Password must be at least 8 characters.</div>
+      </div>
+      <div class="mb-3">
+        <label for="confirmPassword" class="form-label">Confirm New Password</label>
+        <input type="password"
+               class="form-control"
+               id="confirmPassword"
+               name="confirm_password"
+               required
+               minlength="8">
+      </div>
+      <button type="submit" class="btn btn-primary" id="submitBtn">Reset Password</button>
+    </form>
+    <p class="mt-3">
+      Remember your password? <a href="{{ url_for("login_page") }}">Login here</a>
+    </p>
+  </div>
+{% endblock content %}
+
+{% block scripts %}
+  <script type="module">
+  import { getErrorMessage, showModal } from '/static/js/utils.js';
+
+  // Extract token from URL query parameter
+  const urlParams = new URLSearchParams(window.location.search);
+  const token = urlParams.get('token');
+
+  // If no token, show error and disable form
+  if (!token) {
+    document.getElementById('errorMessage').textContent =
+      'Invalid or missing reset token. Please request a new password reset.';
+    showModal('errorModal');
+    document.getElementById('submitBtn').disabled = true;
+  }
+
+  const resetPasswordForm = document.getElementById('resetPasswordForm');
+  const submitBtn = document.getElementById('submitBtn');
+
+  resetPasswordForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+
+    const newPassword = document.getElementById('newPassword').value;
+    const confirmPassword = document.getElementById('confirmPassword').value;
+
+    // Client-side password matching validation
+    if (newPassword !== confirmPassword) {
+      document.getElementById('errorMessage').textContent = 'Passwords do not match.';
+      showModal('errorModal');
+      return;
+    }
+
+    // Disable button during submission
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Resetting...';
+
+    try {
+      const response = await fetch('/api/users/reset-password', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          token: token,
+          new_password: newPassword,
+        }),
+      });
+
+      if (response.ok) {
+        document.getElementById('successMessage').textContent =
+          'Password reset successfully! You can now log in with your new password.';
+        showModal('successModal');
+
+        // Redirect to login after modal is hidden
+        document.getElementById('successModal').addEventListener('hidden.bs.modal', () => {
+          window.location.href = '/login';
+        }, { once: true });
+      } else {
+        const error = await response.json();
+        document.getElementById('errorMessage').textContent = getErrorMessage(error);
+        showModal('errorModal');
+
+        // If token is invalid/expired, suggest requesting new one
+        if (response.status === 400) {
+          document.getElementById('errorMessage').textContent +=
+            ' Please request a new password reset.';
+        }
+      }
+    } catch (error) {
+      document.getElementById('errorMessage').textContent =
+        'Network error. Please check your connection and try again.';
+      showModal('errorModal');
+    } finally {
+      // Re-enable button
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Reset Password';
+    }
+  });
+  </script>
+{% endblock scripts %}
+
+
+## login.html forgot password link
+<div class="mt-3">
+  <p class="mb-2">
+    <a href="{{ url_for("forgot_password_page") }}">Forgot your password?</a>
+  </p>
+  <p class="mb-0">
+    Don't have an account? <a href="{{ url_for("register_page") }}">Register here</a>
+  </p>
+</div>
+
+
+## account.html Change Password form
+<!-- Change Password Section -->
+<div class="mb-4">
+  <h5>Change Password</h5>
+  <form id="changePasswordForm">
+    <div class="mb-3">
+      <label for="currentPassword" class="form-label">Current Password</label>
+      <input type="password"
+             class="form-control"
+             id="currentPassword"
+             name="current_password"
+             required>
+    </div>
+    <div class="mb-3">
+      <label for="newPassword" class="form-label">New Password</label>
+      <input type="password"
+             class="form-control"
+             id="newPassword"
+             name="new_password"
+             required
+             minlength="8">
+      <div class="form-text">Password must be at least 8 characters.</div>
+    </div>
+    <div class="mb-3">
+      <label for="confirmNewPassword" class="form-label">Confirm New Password</label>
+      <input type="password"
+             class="form-control"
+             id="confirmNewPassword"
+             name="confirm_new_password"
+             required
+             minlength="8">
+    </div>
+    <button type="submit" class="btn btn-primary" id="changePasswordBtn">Change Password</button>
+  </form>
+</div>
+
+
+## account.html Change Password JS handler
+  // Change Password Handler
+  const changePasswordForm = document.getElementById('changePasswordForm');
+  const changePasswordBtn = document.getElementById('changePasswordBtn');
+
+  changePasswordForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+
+    const token = getToken();
+    if (!token) {
+      window.location.href = '/login';
+      return;
+    }
+
+    const currentPassword = document.getElementById('currentPassword').value;
+    const newPassword = document.getElementById('newPassword').value;
+    const confirmNewPassword = document.getElementById('confirmNewPassword').value;
+
+    // Client-side password matching validation
+    if (newPassword !== confirmNewPassword) {
+      document.getElementById('errorMessage').textContent = 'New passwords do not match.';
+      showModal('errorModal');
+      return;
+    }
+
+    // Disable button during submission
+    changePasswordBtn.disabled = true;
+    changePasswordBtn.textContent = 'Changing...';
+
+    try {
+      const response = await fetch('/api/users/me/password', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      });
+
+      if (response.status === 401) {
+        window.location.href = '/login';
+        return;
+      }
+
+      if (response.ok) {
+        // Clear form
+        changePasswordForm.reset();
+
+        document.getElementById('successMessage').textContent =
+          'Password changed successfully!';
+        showModal('successModal');
+      } else {
+        const error = await response.json();
+        document.getElementById('errorMessage').textContent = getErrorMessage(error);
+        showModal('errorModal');
+      }
+    } catch (error) {
+      document.getElementById('errorMessage').textContent =
+        'Network error. Please check your connection and try again.';
+      showModal('errorModal');
+    } finally {
+      // Re-enable button
+      changePasswordBtn.disabled = false;
+      changePasswordBtn.textContent = 'Change Password';
+    }
+  });
 
 
 ##
