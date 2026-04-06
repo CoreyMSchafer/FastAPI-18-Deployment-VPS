@@ -8,6 +8,7 @@ dependencies = [
     "aiosmtplib>=5.1.0",
     "aiosqlite>=0.22.1",
     "alembic>=1.18.4",
+    "boto3>=1.42.83",
     "fastapi[standard]>=0.128.0",
     "greenlet>=3.3.0",
     "pillow>=12.1.1",
