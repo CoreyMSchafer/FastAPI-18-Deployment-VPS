@@ -1,125 +1,397 @@
-## S3 Configuration for .env file
-S3_BUCKET_NAME=fastapi-blog-uploads
-S3_REGION=us-east-1
-S3_ACCESS_KEY_ID=your-access-key-id
-S3_SECRET_ACCESS_KEY=your-secret-access-key
+## Test DB and Bucket
+os.environ["DATABASE_URL"] = (
+    "postgresql+psycopg://bloguser:blogpass@localhost/test_blog"
+)
+os.environ["S3_BUCKET_NAME"] = "test-bucket"
+os.environ["SECRET_KEY"] = "test-secret-key-for-testing-only"
 
 
-## S3 Settings for config.py
-# S3 Configuration
-s3_bucket_name: str
-s3_region: str = "us-east-1"
-s3_access_key_id: SecretStr | None = None
-s3_secret_access_key: SecretStr | None = None
-s3_endpoint_url: str | None = None
+
+## Dummy S3/AWS Credentials
+os.environ["S3_ACCESS_KEY_ID"] = "testing"
+os.environ["S3_SECRET_ACCESS_KEY"] = "testing"
+os.environ["S3_REGION"] = "us-east-1"
+
+os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
 
 
-## _get_s3_client helper for image_utils.py
-def _get_s3_client():
-    return boto3.client(
-        "s3",
-        region_name=settings.s3_region,
-        aws_access_key_id=(
-            settings.s3_access_key_id.get_secret_value()
-            if settings.s3_access_key_id
-            else None
-        ),
-        aws_secret_access_key=(
-            settings.s3_secret_access_key.get_secret_value()
-            if settings.s3_secret_access_key
-            else None
-        ),
-        endpoint_url=settings.s3_endpoint_url,
+
+## App Imports
+import boto3
+import pytest
+from httpx import ASGITransport, AsyncClient
+from moto import mock_aws
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+
+from database import Base, get_db
+from main import app
+
+
+
+## Test Engine
+@pytest.fixture(scope="session")
+def test_engine():
+    engine = create_async_engine(
+        os.environ["DATABASE_URL"],
+        poolclass=NullPool,
+    )
+    return engine
+
+
+
+## Setup Database
+@pytest.fixture(scope="session")
+async def setup_database(test_engine):
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    yield
+
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+    await test_engine.dispose()
+
+
+
+## DB Session (Transactional Rollback)
+@pytest.fixture
+async def db_session(
+    test_engine,
+    setup_database,
+) -> AsyncGenerator[AsyncSession]:
+    conn = await test_engine.connect()
+    trans = await conn.begin()
+
+    test_async_session = async_sessionmaker(
+        bind=conn,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
     )
 
+    async with test_async_session() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+            await trans.rollback()
+            await conn.close()
 
-## _upload_to_s3 and _delete_from_s3 for image_utils.py
-def _upload_to_s3(file_bytes: bytes, key: str) -> None:
-    s3 = _get_s3_client()
-    s3.upload_fileobj(
-        BytesIO(file_bytes),
-        settings.s3_bucket_name,
-        key,
-        ExtraArgs={"ContentType": "image/jpeg"},
+
+
+## Mocked AWS
+@pytest.fixture
+def mocked_aws():
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=os.environ["S3_BUCKET_NAME"])
+        yield s3
+
+
+
+## Client Fixture
+@pytest.fixture
+async def client(
+    db_session: AsyncSession,
+    mocked_aws,
+) -> AsyncGenerator[AsyncClient]:
+
+    async def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as ac:
+        yield ac
+
+    app.dependency_overrides.clear()
+
+
+
+## Auth Helpers
+async def create_test_user(
+    client: AsyncClient,
+    username: str = "testuser",
+    email: str = "test@example.com",
+    password: str = "testpassword123",
+) -> dict:
+    response = await client.post(
+        "/api/users",
+        json={
+            "username": username,
+            "email": email,
+            "password": password,
+        },
+    )
+    assert response.status_code == 201, f"Failed to create user: {response.text}"
+    return response.json()
+
+
+async def login_user(
+    client: AsyncClient,
+    email: str = "test@example.com",
+    password: str = "testpassword123",
+) -> str:
+    response = await client.post(
+        "/api/users/token",
+        data={
+            "username": email,
+            "password": password,
+        },
+    )
+    assert response.status_code == 200, f"Failed to login: {response.text}"
+    return response.json()["access_token"]
+
+
+def auth_header(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+
+## Test Create Post Success
+@pytest.mark.anyio
+async def test_create_post_success(client: AsyncClient):
+    user = await create_test_user(client)
+    token = await login_user(client)
+    headers = auth_header(token)
+
+    response = await client.post(
+        "/api/posts",
+        json={"title": "My First Post", "content": "This is the content"},
+        headers=headers,
     )
 
-
-def _delete_from_s3(key: str) -> None:
-    s3 = _get_s3_client()
-    s3.delete_object(Bucket=settings.s3_bucket_name, Key=key)
-
-
-## Async S3 wrappers for image_utils.py
-async def upload_profile_image(file_bytes: bytes, filename: str) -> None:
-    key = f"profile_pics/{filename}"
-    await run_in_threadpool(_upload_to_s3, file_bytes, key)
+    assert response.status_code == 201
+    data = response.json()
+    assert data["title"] == "My First Post"
+    assert data["content"] == "This is the content"
+    assert data["user_id"] == user["id"]
+    assert "id" in data
+    assert "date_posted" in data
+    assert data["author"]["username"] == "testuser"
 
 
-async def delete_profile_image(filename: str | None) -> None:
-    if filename is None:
-        return
-    key = f"profile_pics/{filename}"
-    await run_in_threadpool(_delete_from_s3, key)
+
+## Test Create Post Unauthorized
+@pytest.mark.anyio
+async def test_create_post_unauthorized(client: AsyncClient):
+    response = await client.post(
+        "/api/posts",
+        json={"title": "Test Post", "content": "Test content"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Not authenticated"
 
 
-## S3 image_path return for models.py
-return f"https://{settings.s3_bucket_name}.s3.{settings.s3_region}.amazonaws.com/profile_pics/{self.image_file}"
+
+## Test Update Post Success
+@pytest.mark.anyio
+async def test_update_post_success(client: AsyncClient):
+    await create_test_user(client)
+    token = await login_user(client)
+    headers = auth_header(token)
+
+    response = await client.post(
+        "/api/posts",
+        json={"title": "Original Title", "content": "Original content"},
+        headers=headers,
+    )
+    post_id = response.json()["id"]
+
+    response = await client.patch(
+        f"/api/posts/{post_id}",
+        json={"title": "Updated Title"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["title"] == "Updated Title"
+    assert data["content"] == "Original content"
 
 
-## S3 upload try/except for routers/users.py (upload_profile_picture)
-# Upload to S3 (also runs in threadpool via async wrapper)
-try:
-    await upload_profile_image(processed_bytes, new_filename)
-except ClientError as err:
-    raise HTTPException(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail="Failed to upload image. Please try again.",
-    ) from err
+
+## Test Update Post Wrong User
+@pytest.mark.anyio
+async def test_update_post_wrong_user(client: AsyncClient):
+    await create_test_user(client, username="user1", email="user1@example.com")
+    token1 = await login_user(client, email="user1@example.com")
+
+    response = await client.post(
+        "/api/posts",
+        json={"title": "User 1's Post", "content": "Only user 1 can edit this"},
+        headers=auth_header(token1),
+    )
+    post_id = response.json()["id"]
+
+    await create_test_user(client, username="user2", email="user2@example.com")
+    token2 = await login_user(client, email="user2@example.com")
+
+    response = await client.patch(
+        f"/api/posts/{post_id}",
+        json={"title": "Hacked Title"},
+        headers=auth_header(token2),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Not authorized to update this post"
 
 
-## check_s3.py
-from io import BytesIO
 
-from botocore.exceptions import BotoCoreError, ClientError
+## Test Pagination
+@pytest.mark.anyio
+async def test_get_posts_with_pagination(client: AsyncClient):
+    await create_test_user(client)
+    token = await login_user(client)
+    headers = auth_header(token)
 
-from config import settings
-from image_utils import _get_s3_client
-
-
-def check_s3_connection():
-    s3 = _get_s3_client()
-
-    print(f"Bucket: {settings.s3_bucket_name}")
-    print(f"Region: {settings.s3_region}")
-    print()
-
-    test_key = "profile_pics/test.txt"
-
-    try:
-        s3.upload_fileobj(
-            BytesIO(b"test"),
-            settings.s3_bucket_name,
-            test_key,
-            ExtraArgs={"ContentType": "text/plain"},
+    for i in range(5):
+        response = await client.post(
+            "/api/posts",
+            json={"title": f"Post {i}", "content": f"Content for post {i}"},
+            headers=headers,
         )
-        print("Upload: SUCCESS")
-    except (BotoCoreError, ClientError) as exc:
-        print(f"Upload: FAILED - {exc}")
-        return
+        assert response.status_code == 201
 
-    try:
-        s3.delete_object(Bucket=settings.s3_bucket_name, Key=test_key)
-        print("Delete: SUCCESS")
-    except (BotoCoreError, ClientError) as exc:
-        print(f"Delete: FAILED - {exc}")
-        return
+    response = await client.get("/api/posts")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 5
+    assert len(data["posts"]) == 5
+    assert data["has_more"] is False
 
-    print()
-    print("All tests passed! Your S3 configuration is working.")
+    response = await client.get("/api/posts?limit=2")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 5
+    assert len(data["posts"]) == 2
+    assert data["has_more"] is True
+
+    response = await client.get("/api/posts?skip=2&limit=2")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 5
+    assert len(data["posts"]) == 2
+    assert data["skip"] == 2
+    assert data["limit"] == 2
 
 
-if __name__ == "__main__":
-    check_s3_connection()
+
+## Test Create User Validation Error
+@pytest.mark.anyio
+async def test_create_user_validation_error(client: AsyncClient):
+    response = await client.post(
+        "/api/users",
+        json={
+            "username": "testuser",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "email" in response.text
+    assert "password" in response.text
+
+
+
+## Test Create User Duplicate Email
+@pytest.mark.anyio
+async def test_create_user_duplicate_email(client: AsyncClient):
+    await create_test_user(client)
+
+    response = await client.post(
+        "/api/users",
+        json={
+            "username": "different_user",
+            "email": "test@example.com",
+            "password": "password123",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Email already registered"
+
+
+
+## Test Create User Success
+@pytest.mark.anyio
+async def test_create_user_success(client: AsyncClient):
+    response = await client.post(
+        "/api/users",
+        json={
+            "username": "newuser",
+            "email": "newuser@example.com",
+            "password": "securepassword123",
+        },
+    )
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["username"] == "newuser"
+    assert data["email"] == "newuser@example.com"
+    assert "id" in data
+    assert "image_path" in data
+    assert "password" not in data
+    assert "password_hash" not in data
+
+
+
+## Test Upload Profile Picture
+@pytest.mark.anyio
+async def test_upload_profile_picture(client: AsyncClient, mocked_aws):
+    user = await create_test_user(client)
+    token = await login_user(client)
+
+    test_image_path = Path(__file__).parent / "test_image.jpg"
+    image_bytes = test_image_path.read_bytes()
+
+    response = await client.patch(
+        f"/api/users/{user['id']}/picture",
+        files={"file": ("profile.jpg", BytesIO(image_bytes), "image/jpeg")},
+        headers=auth_header(token),
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["image_file"] is not None
+    assert data["image_file"].endswith(".jpg")
+    assert "s3" in data["image_path"]
+
+    s3_objects = mocked_aws.list_objects_v2(Bucket="test-bucket")
+    assert "Contents" in s3_objects
+    assert len(s3_objects["Contents"]) == 1
+    assert s3_objects["Contents"][0]["Key"].endswith(data["image_file"])
+
+
+
+## Test Forgot Password Sends Email
+@pytest.mark.anyio
+async def test_forgot_password_sends_email(client: AsyncClient):
+    await create_test_user(client)
+
+    with patch(
+        "routers.users.send_password_reset_email",
+        new_callable=AsyncMock,
+    ) as mock_send:
+        response = await client.post(
+            "/api/users/forgot-password",
+            json={"email": "test@example.com"},
+        )
+
+        assert response.status_code == 202
+        mock_send.assert_awaited_once()
+        call_kwargs = mock_send.call_args.kwargs
+        assert call_kwargs["to_email"] == "test@example.com"
+        assert call_kwargs["username"] == "testuser"
+        assert "token" in call_kwargs
+
 
 
 ##
