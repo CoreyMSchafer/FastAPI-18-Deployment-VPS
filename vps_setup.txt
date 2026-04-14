@@ -480,6 +480,18 @@ PART 3: FASTAPI APPLICATION SETUP
         # Run this on your LOCAL machine (not the server):
         # scp -r /path/to/your/project/* coreyms@YOUR_IP_ADDRESS:/var/www/fastapi-blog/
 
+    -> Set secure file permissions (deny by default, then open what's needed)
+
+        # Lock down everything first: owner read/write only for files,
+        # owner read/write/execute only for directories
+        find . -type f -exec chmod 600 {} \;
+        find . -type d -exec chmod 700 {} \;
+
+        # Open up what nginx (www-data) needs: it must traverse the project
+        # directory and read static files
+        chmod 755 .
+        chmod -R 755 static
+
     -> Create virtual environment and install dependencies with UV
         # (should already be in /var/www/fastapi-blog from previous step)
         uv sync
@@ -514,9 +526,16 @@ PART 3: FASTAPI APPLICATION SETUP
         uv run alembic upgrade head
 
     -> Test the application manually
+
+        # Temporarily open port 8000 in the firewall for testing
+        sudo ufw allow 8000/tcp
+
         uv run fastapi run --host 0.0.0.0 --port 8000
-        # Visit http://YOUR_IP:8000 to test (temporarily allow port 8000 in UFW if needed)
+        # Visit http://YOUR_IP:8000 to test
         # Ctrl+C to stop
+
+        # Close the temporary port (nginx will handle traffic from here on)
+        sudo ufw delete allow 8000/tcp
 
 --------------------------------------------------------------------------------
 
@@ -702,6 +721,7 @@ NOTES AND REMINDERS
     [x] Firewall enabled (UFW)
     [x] Fail2Ban protecting SSH (integrated with UFW)
     [x] Automatic security updates enabled
+    [x] File permissions locked down (deny by default)
     [x] SSL/TLS certificate installed
     [x] Security headers in NGINX (including HSTS with preload)
     [x] Uvicorn configured with --proxy-headers for nginx
