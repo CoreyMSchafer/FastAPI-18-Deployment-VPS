@@ -1,396 +1,150 @@
-## Test DB and Bucket
-os.environ["DATABASE_URL"] = (
-    "postgresql+psycopg://bloguser:blogpass@localhost/test_blog"
-)
-os.environ["S3_BUCKET_NAME"] = "test-bucket"
-os.environ["SECRET_KEY"] = "test-secret-key-for-testing-only"
-
-
-
-## Dummy S3/AWS Credentials
-os.environ["S3_ACCESS_KEY_ID"] = "testing"
-os.environ["S3_SECRET_ACCESS_KEY"] = "testing"
-os.environ["S3_REGION"] = "us-east-1"
-
-os.environ["AWS_ACCESS_KEY_ID"] = "testing"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
-os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
-
-
-
-## App Imports
-import boto3
-import pytest
-from httpx import ASGITransport, AsyncClient
-from moto import mock_aws
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
-
-from database import Base, get_db
-from main import app
-
-
-
-## Test Engine
-@pytest.fixture(scope="session")
-def test_engine():
-    engine = create_async_engine(
-        os.environ["DATABASE_URL"],
-        poolclass=NullPool,
-    )
-    return engine
-
-
-
-## Setup Database
-@pytest.fixture(scope="session")
-async def setup_database(test_engine):
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    yield
-
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
-    await test_engine.dispose()
-
-
-
-## DB Session (Transactional Rollback)
-@pytest.fixture
-async def db_session(
-    test_engine,
-    setup_database,
-) -> AsyncGenerator[AsyncSession]:
-    conn = await test_engine.connect()
-    trans = await conn.begin()
-
-    test_async_session = async_sessionmaker(
-        bind=conn,
-        class_=AsyncSession,
-        expire_on_commit=False,
-        join_transaction_mode="create_savepoint",
-    )
-
-    async with test_async_session() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-            await trans.rollback()
-            await conn.close()
-
-
-
-## Mocked AWS
-@pytest.fixture
-def mocked_aws():
-    with mock_aws():
-        s3 = boto3.client("s3", region_name="us-east-1")
-        s3.create_bucket(Bucket=os.environ["S3_BUCKET_NAME"])
-        yield s3
-
-
-
-## Client Fixture
-@pytest.fixture
-async def client(
-    db_session: AsyncSession,
-    mocked_aws,
-) -> AsyncGenerator[AsyncClient]:
-
-    async def override_get_db():
-        yield db_session
-
-    app.dependency_overrides[get_db] = override_get_db
-
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-    ) as ac:
-        yield ac
-
-    app.dependency_overrides.clear()
-
-
-
-## Auth Helpers
-async def create_test_user(
-    client: AsyncClient,
-    username: str = "testuser",
-    email: str = "test@example.com",
-    password: str = "testpassword123",
-) -> dict:
-    response = await client.post(
-        "/api/users",
-        json={
-            "username": username,
-            "email": email,
-            "password": password,
-        },
-    )
-    assert response.status_code == 201, f"Failed to create user: {response.text}"
-    return response.json()
-
-
-async def login_user(
-    client: AsyncClient,
-    email: str = "test@example.com",
-    password: str = "testpassword123",
-) -> str:
-    response = await client.post(
-        "/api/users/token",
-        data={
-            "username": email,
-            "password": password,
-        },
-    )
-    assert response.status_code == 200, f"Failed to login: {response.text}"
-    return response.json()["access_token"]
-
-
-def auth_header(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
-
-## Test Create Post Success
-@pytest.mark.anyio
-async def test_create_post_success(client: AsyncClient):
-    user = await create_test_user(client)
-    token = await login_user(client)
-    headers = auth_header(token)
-
-    response = await client.post(
-        "/api/posts",
-        json={"title": "My First Post", "content": "This is the content"},
-        headers=headers,
-    )
-
-    assert response.status_code == 201
-    data = response.json()
-    assert data["title"] == "My First Post"
-    assert data["content"] == "This is the content"
-    assert data["user_id"] == user["id"]
-    assert "id" in data
-    assert "date_posted" in data
-    assert data["author"]["username"] == "testuser"
-
-
-
-## Test Create Post Unauthorized
-@pytest.mark.anyio
-async def test_create_post_unauthorized(client: AsyncClient):
-    response = await client.post(
-        "/api/posts",
-        json={"title": "Test Post", "content": "Test content"},
-    )
-
-    assert response.status_code == 401
-    assert response.json()["detail"] == "Not authenticated"
-
-
-
-## Test Update Post Success
-@pytest.mark.anyio
-async def test_update_post_success(client: AsyncClient):
-    await create_test_user(client)
-    token = await login_user(client)
-    headers = auth_header(token)
-
-    response = await client.post(
-        "/api/posts",
-        json={"title": "Original Title", "content": "Original content"},
-        headers=headers,
-    )
-    post_id = response.json()["id"]
-
-    response = await client.patch(
-        f"/api/posts/{post_id}",
-        json={"title": "Updated Title"},
-        headers=headers,
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["title"] == "Updated Title"
-    assert data["content"] == "Original content"
-
-
-
-## Test Update Post Wrong User
-@pytest.mark.anyio
-async def test_update_post_wrong_user(client: AsyncClient):
-    await create_test_user(client, username="user1", email="user1@example.com")
-    token1 = await login_user(client, email="user1@example.com")
-
-    response = await client.post(
-        "/api/posts",
-        json={"title": "User 1's Post", "content": "Only user 1 can edit this"},
-        headers=auth_header(token1),
-    )
-    post_id = response.json()["id"]
-
-    await create_test_user(client, username="user2", email="user2@example.com")
-    token2 = await login_user(client, email="user2@example.com")
-
-    response = await client.patch(
-        f"/api/posts/{post_id}",
-        json={"title": "Hacked Title"},
-        headers=auth_header(token2),
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Not authorized to update this post"
-
-
-
-## Test Pagination
-@pytest.mark.anyio
-async def test_get_posts_with_pagination(client: AsyncClient):
-    await create_test_user(client)
-    token = await login_user(client)
-    headers = auth_header(token)
-
-    for i in range(5):
-        response = await client.post(
-            "/api/posts",
-            json={"title": f"Post {i}", "content": f"Content for post {i}"},
-            headers=headers,
-        )
-        assert response.status_code == 201
-
-    response = await client.get("/api/posts")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["total"] == 5
-    assert len(data["posts"]) == 5
-    assert data["has_more"] is False
-
-    response = await client.get("/api/posts?limit=2")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["total"] == 5
-    assert len(data["posts"]) == 2
-    assert data["has_more"] is True
-
-    response = await client.get("/api/posts?skip=2&limit=2")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["total"] == 5
-    assert len(data["posts"]) == 2
-    assert data["skip"] == 2
-    assert data["limit"] == 2
-
-
-
-## Test Create User Validation Error
-@pytest.mark.anyio
-async def test_create_user_validation_error(client: AsyncClient):
-    response = await client.post(
-        "/api/users",
-        json={
-            "username": "testuser",
-        },
-    )
-
-    assert response.status_code == 422
-    assert "email" in response.text
-    assert "password" in response.text
-
-
-
-## Test Create User Duplicate Email
-@pytest.mark.anyio
-async def test_create_user_duplicate_email(client: AsyncClient):
-    await create_test_user(client)
-
-    response = await client.post(
-        "/api/users",
-        json={
-            "username": "different_user",
-            "email": "test@example.com",
-            "password": "password123",
-        },
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Email already registered"
-
-
-
-## Test Create User Success
-@pytest.mark.anyio
-async def test_create_user_success(client: AsyncClient):
-    response = await client.post(
-        "/api/users",
-        json={
-            "username": "newuser",
-            "email": "newuser@example.com",
-            "password": "securepassword123",
-        },
-    )
-
-    assert response.status_code == 201
-    data = response.json()
-    assert data["username"] == "newuser"
-    assert data["email"] == "newuser@example.com"
-    assert "id" in data
-    assert "image_path" in data
-    assert "password" not in data
-    assert "password_hash" not in data
-
-
-
-## Test Upload Profile Picture
-@pytest.mark.anyio
-async def test_upload_profile_picture(client: AsyncClient, mocked_aws):
-    user = await create_test_user(client)
-    token = await login_user(client)
-
-    test_image_path = Path(__file__).parent / "test_image.jpg"
-    image_bytes = test_image_path.read_bytes()
-
-    response = await client.patch(
-        f"/api/users/{user['id']}/picture",
-        files={"file": ("profile.jpg", BytesIO(image_bytes), "image/jpeg")},
-        headers=auth_header(token),
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["image_file"] is not None
-    assert data["image_file"].endswith(".jpg")
-    assert "s3" in data["image_path"]
-
-    s3_objects = mocked_aws.list_objects_v2(Bucket="test-bucket")
-    assert "Contents" in s3_objects
-    assert len(s3_objects["Contents"]) == 1
-    assert s3_objects["Contents"][0]["Key"].endswith(data["image_file"])
-
-
-
-## Test Forgot Password Sends Email
-@pytest.mark.anyio
-async def test_forgot_password_sends_email(client: AsyncClient):
-    await create_test_user(client)
-
-    with patch(
-        "routers.users.send_password_reset_email",
-        new_callable=AsyncMock,
-    ) as mock_send:
-        response = await client.post(
-            "/api/users/forgot-password",
-            json={"email": "test@example.com"},
-        )
-
-        assert response.status_code == 202
-        mock_send.assert_awaited_once()
-        call_kwargs = mock_send.call_args.kwargs
-        assert call_kwargs["to_email"] == "test@example.com"
-        assert call_kwargs["username"] == "testuser"
-        assert "token" in call_kwargs
+## Health Check Endpoint
+@app.get("/health")
+async def health_check(db: Annotated[AsyncSession, Depends(get_db)]):
+    try:
+        await db.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        ) from exc
+    return {"status": "healthy"}
+
+
+
+## Nginx Initial Config
+# Redirect www to non-www
+server {
+    listen 80;
+    listen [::]:80;
+    server_name www.myawesomeapp.com;
+    return 301 $scheme://myawesomeapp.com$request_uri;
+}
+
+# Main server block
+server {
+    listen 80;
+    listen [::]:80;
+    server_name myawesomeapp.com;
+
+    root /var/www/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+
+
+
+## Environment File Template
+DATABASE_URL=postgresql+psycopg://bloguser:blogpass@localhost/blog
+SECRET_KEY=PASTE_YOUR_GENERATED_KEY_HERE
+MAIL_SERVER=smtp.yourprovider.com
+MAIL_PORT=587
+MAIL_USERNAME=your_email
+MAIL_PASSWORD=your_app_password
+MAIL_FROM=noreply@fastapiblog.com
+MAIL_USE_TLS=true
+FRONTEND_URL=https://myawesomeapp.com
+S3_BUCKET_NAME=your-bucket-name
+S3_REGION=us-east-1
+S3_ACCESS_KEY_ID=your-access-key
+S3_SECRET_ACCESS_KEY=your-secret-key
+
+
+
+## Systemd Service File
+[Unit]
+Description=FastAPI Blog Application
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+User=coreyms
+Group=www-data
+WorkingDirectory=/var/www/fastapi-blog
+Environment="PATH=/var/www/fastapi-blog/.venv/bin"
+EnvironmentFile=/var/www/fastapi-blog/.env
+ExecStart=/var/www/fastapi-blog/.venv/bin/fastapi run \
+    --workers 1 \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --proxy-headers
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+
+## Nginx Full Config
+# Redirect www to non-www
+server {
+    listen 80;
+    listen [::]:80;
+    server_name www.myawesomeapp.com;
+    return 301 https://myawesomeapp.com$request_uri;
+}
+
+# Redirect HTTP to HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name myawesomeapp.com;
+    return 301 https://$server_name$request_uri;
+}
+
+# Main HTTPS server block
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name myawesomeapp.com;
+
+    # SSL certificates (managed by Certbot)
+    ssl_certificate /etc/letsencrypt/live/myawesomeapp.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/myawesomeapp.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    # HSTS: Tell browsers to always use HTTPS (max-age is 2 years)
+    # "preload" allows submission to browser preload lists (hstspreload.org)
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # Serve static files directly
+    location /static/ {
+        alias /var/www/fastapi-blog/static/;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Proxy to FastAPI
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket support (if needed)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # File upload size limit (matches our app's max_upload_size_bytes setting)
+    client_max_body_size 5M;
+}
 
 
 
